@@ -1,15 +1,17 @@
 # Auto Chess Bot 🎮♟️
 
+A chess bot for Chess.com and Lichess.org using Stockfish engine. Features human-like gameplay with variable thinking times, multiple play modes (auto/manual/mouseless), continuous puzzle solving, and move visualization. For educational purposes and unrated games only.
+
 ![GUI Screenshot](https://github.com/user-attachments/assets/6ee9bfa2-4440-455d-90fc-fb027aecaffe)
 
-A chess bot for Chess.com and Lichess.org using Stockfish engine. Features human-like gameplay with variable thinking times, multiple play modes (auto/manual/mouseless), continuous puzzle solving, and move visualization. For educational purposes and unrated games only.
+
 
 **This is a work in progress and updates will come**
 ![Animation_preview](https://github.com/user-attachments/assets/1c8332d9-b460-48cd-99f5-332af7d3b7a6)
 
 
 
-## ✨ Features
+##  **Features**
 
 
 ###  Human-like Behavior
