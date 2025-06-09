@@ -81,7 +81,7 @@ cd Auto_chess_bot
 5. Click "Start" to begin playing
 
 ### Manual Mode
-When manual mode is enabled, the bot will suggest moves (shown with an arrow overlay), but you'll need to press '3' to execute each move.
+When manual mode is enabled, the bot will suggest moves in the history, but you'll need to press '3' to execute each move.
 
 ### Mouseless Mode
 This mode is only available for Lichess.org and allows the bot to make moves without mouse movements, reducing the chance of detection.
