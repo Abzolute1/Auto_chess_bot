@@ -21,7 +21,7 @@ A chess bot for Chess.com and Lichess.org using Stockfish engine. Features human
 
 ###  Multiple Playing Modes
 - Automatic mode for fully automated play
-- Manual mode where the bot suggests moves but you make them
+- Manual mode where the bot suggests moves but you make them (Must hold 3 to enter manual mode when manual mode is checked)
 - Mouseless mode for Lichess.org (no mouse movements required)
 
 ###  Continuous Play Options
@@ -30,7 +30,8 @@ A chess bot for Chess.com and Lichess.org using Stockfish engine. Features human
 
 ###  Fun Features
 - "Bongcloud" opening mode (the famous e4 followed by Ke2)
-- Move history display and PGN export
+- Move history display and PGN export'
+- Login works only on Lichess, but you can play bots on chess.com as guest!
 
 ##  Requirements
 
@@ -62,7 +63,7 @@ cd Auto_chess_bot
 4. Download Stockfish:
 - Get the latest version from [the official website](https://stockfishchess.org/download/)
 - Extract the ZIP file to a location on your computer
-- You'll select this location in the app's "Select Stockfish" button
+- You'll select this location in the app's "Select Stockfish" button (The location is not hardcoded, **you** will select this inside the the program)
 
 ##  Usage
 
