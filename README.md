@@ -60,7 +60,7 @@ cd Auto_chess_bot
 
 1. Run the application: python src/gui.py
 
-2. Click "Open Browser" to launch Chrome
+2. Click "Open Browser" to launch Chrome **"Must use the browser from the GUI and have Chrome installed!"**
 
 3. Navigate to Chess.com or Lichess.org and select the appropriate option in the app
 
