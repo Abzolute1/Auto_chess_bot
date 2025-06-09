@@ -2,7 +2,8 @@
 
 A chess bot for Chess.com and Lichess.org using Stockfish engine. Features human-like gameplay with variable thinking times, multiple play modes (auto/manual/mouseless), continuous puzzle solving, and move visualization. For educational purposes and unrated games only.
 
-![GUI Screenshot](https://github.com/user-attachments/assets/6ee9bfa2-4440-455d-90fc-fb027aecaffe)
+![gui_preview](https://github.com/user-attachments/assets/7030093d-ac27-4455-9187-e57831b9da7d)
+
 
 
 
