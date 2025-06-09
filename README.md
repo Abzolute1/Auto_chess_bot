@@ -14,6 +14,35 @@ A chess bot for Chess.com and Lichess.org using Stockfish engine. Features human
 
 ##  **Features**
 
+Stockfish 17.1 official elo from 1 - 20. Use this according to the bracket of skill you mean to play. If you play a bot rated for 1300, but chooses skill-level 12 you will **NOT** be close to the accuracy threshold I have created. Skill level 11 will completely annihilate a 1300 bot, instead choose 0.
+
+ 0    | ~1347
+ 1    | ~1490
+ 2    | ~1597
+ 3    | ~1694
+ 4    | ~1785
+ 5    | ~1871
+ 6    | ~1954
+ 7    | ~2035
+ 8    | ~2113
+ 9    | ~2189
+10    | ~2264
+11    | ~2337
+12    | ~2409
+13    | ~2480
+14    | ~2550
+15    | ~2619
+16    | ~2686
+17    | ~2754
+18    | ~2820
+19    | ~2886
+20    | Full strength (≈ 3100+ depending on hardware)
+
+
+Memory can be kept at 512 unless you are trying to beat another Stockfish set at high elo. Memeory is the amount of RAM allocated for Stockfish so it doesn't recalculate the same positions. Anything over 1024 has diminishing returns unless you are fighting 3600 elo stockfish and need billions of calculations stored in RAM.
+
+Depth controls how deeply the engine searches into the position tree — in other words, how many half-moves (plies) it looks ahead before making a decision. I would suggest having it at max 15. 
+
 
 ###  Human-like Behavior
 - Variable thinking times based on position complexity
