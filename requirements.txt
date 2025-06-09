@@ -1,0 +1,8 @@
+selenium
+undetected-chromedriver
+webdriver-manager
+pyautogui
+python-chess
+stockfish
+pyqt6
+keyboard
