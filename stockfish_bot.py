@@ -11,6 +11,7 @@ from grabbers.chesscom_grabber import ChesscomGrabber
 from grabbers.lichess_grabber import LichessGrabber
 from utilities import char_to_num
 import keyboard
+import math
 
 
 # REMOVED: from nnue_adapter import NNUEAdapter - moved to lazy import
@@ -45,26 +46,41 @@ class StockfishBot(multiprocessing.Process):
         self.is_white = None
         self.engine_type = engine_type  # Add engine type parameter
 
-        # Human-like thinking parameters
+        # Human-like thinking parameters - ENHANCED FOR FASTER PLAY
         self.enable_human_delays = enable_human_delays
-        self.min_thinking_time = min_thinking_time
-        self.max_thinking_time = max_thinking_time
+        self.min_thinking_time = 0.1  # Reduced from 0.5 for faster play
+        self.max_thinking_time = 30.0  # Keep 30 seconds for complex positions
+        self.bullet_max_time = 5.0  # Reduced from 8.0
+        self.blitz_max_time = 10.0  # Reduced from 15.0
+        self.rapid_max_time = 20.0  # Reduced from 30.0
 
         # Human accuracy parameters - FIXED THRESHOLDS
         self.human_accuracy = human_accuracy  # Enable human-like move selection (not always best move)
         self.accuracy_threshold = accuracy_threshold  # Centipawns within which to randomize (75 = more mistakes)
 
-        # NEW: Blunder System Parameters
-        self.enable_blunders = enable_blunders  # Enable deliberate blundering
-        self.blunders_per_game = blunders_per_game  # Target blunders per game (1-3 realistic)
-        self.blunder_severity = blunder_severity  # How bad the blunder should be (100-300cp)
+        # NEW: Complete Error System (Inaccuracies, Mistakes, Blunders)
+        self.enable_errors = enable_blunders  # Renamed to cover all errors
+        self.errors_per_game = {
+            'inaccuracy': 4,  # 25-75cp loss
+            'mistake': 2,  # 75-150cp loss
+            'blunder': blunders_per_game  # 150+ cp loss
+        }
+        self.error_severity = {
+            'inaccuracy': (25, 75),
+            'mistake': (75, 150),
+            'blunder': (blunder_severity, blunder_severity * 2)
+        }
 
-        # Blunder tracking variables
-        self.blunders_this_game = 0
-        self.last_blunder_move = 0
-        self.force_blunder_this_move = False
-        self.blunder_cooldown = 10  # Minimum moves between blunders
-        self.game_blunder_log = []  # Track blunders for analysis
+        # Error tracking
+        self.errors_this_game = {
+            'inaccuracy': 0,
+            'mistake': 0,
+            'blunder': 0
+        }
+        self.last_error_move = 0
+        self.error_cooldown = 5  # Minimum moves between any errors
+        self.game_error_log = []
+        self.force_error_this_move = None  # Type of error to force
 
         # Track game state for advanced move detection
         self.last_opponent_move = None
@@ -87,252 +103,737 @@ class StockfishBot(multiprocessing.Process):
         self.opening_book_ended = False  # Are we out of book?
         self.complex_position_streak = 0  # How many complex positions in a row?
 
-    def should_force_blunder_now(self, board, move_count, stockfish):
-        """
-        Determine if we should force a blunder on this move
-        """
-        if not self.enable_blunders:
-            return False
+        # NEW: Time management tracking
+        self.our_time_remaining = None  # Track our clock
+        self.opponent_time_remaining = None  # Track opponent's clock
+        self.initial_time = None  # Starting time for the game
+        self.time_control_type = None  # bullet/blitz/rapid
+        self.in_time_pressure = False  # Are we low on time?
+        self.severe_time_pressure = False  # Are we critically low?
+        self.critical_time_pressure = False  # Are we about to flag?
+        self.last_thinking_times = []  # Track recent thinking times for patterns
+        self.moves_in_time_pressure = 0  # Track how many moves we've made in time pressure
 
-        # Already made enough blunders this game
-        if self.blunders_this_game >= self.blunders_per_game:
-            return False
+        # FASTER PLAY: Track opening book moves for instant play
+        self.common_openings = {
+            # Italian Game
+            'e2e4,e7e5,g1f3,b8c6,f1c4': ['b7b5', 'f8c5', 'g8f6'],
+            # Spanish/Ruy Lopez
+            'e2e4,e7e5,g1f3,b8c6,f1b5': ['a7a6', 'g8f6', 'f7f5'],
+            # Sicilian Defense
+            'e2e4,c7c5': ['g1f3', 'd2d4', 'b1c3'],
+            # French Defense
+            'e2e4,e7e6': ['d2d4', 'g1f3'],
+            # Caro-Kann
+            'e2e4,c7c6': ['d2d4', 'g1f3', 'b1c3'],
+            # Queen's Gambit
+            'd2d4,d7d5,c2c4': ['e7e6', 'c7c6', 'd5c4'],
+            # King's Indian
+            'd2d4,g8f6,c2c4,g7g6': ['b1c3', 'g1f3'],
+        }
 
-        # Too soon after last blunder
-        if move_count - self.last_blunder_move < self.blunder_cooldown:
-            return False
-
-        # Don't blunder in critical positions
-        if self.is_critical_position(board, stockfish):
-            return False
-
-        # Game length consideration - space blunders throughout the game
-        expected_game_length = 60  # Assume ~60 moves average
-        moves_played = move_count
-
-        # Calculate if we're falling behind on our blunder schedule
-        expected_blunders_by_now = (moves_played / expected_game_length) * self.blunders_per_game
-        blunder_deficit = expected_blunders_by_now - self.blunders_this_game
-
-        # Force blunder if we're significantly behind schedule and in mid/late game
-        if blunder_deficit >= 1.0 and move_count > 15:
-            # Higher chance if we're really behind on blunders
-            force_chance = min(0.4, blunder_deficit * 0.2)
-
-            # Increase chance if we're winning (humans get overconfident)
-            if self.we_are_winning_big:
-                force_chance *= 1.5
-
-            # Increase chance if we've made many good moves in a row
-            if self.consecutive_good_moves > 8:
-                force_chance *= 1.3
-
-            return random.random() < force_chance
-
-        return False
-
-    def is_critical_position(self, board, stockfish):
-        """
-        Check if this is a critical position where we shouldn't blunder
-        """
+    def get_time_remaining(self):
+        """Get time remaining from the grabber"""
         try:
-            # Don't blunder when already losing badly
-            eval_data = stockfish.get_evaluation()
-            if eval_data and eval_data['type'] == 'cp':
-                current_eval = eval_data['value']
-                # Flip for our perspective
-                if not board.turn:
-                    current_eval = -current_eval
+            # This method would need to be implemented in your grabber classes
+            # For now, return a default value if not available
+            if hasattr(self.grabber, 'get_player_time'):
+                return self.grabber.get_player_time(self.is_white)
+            return None
+        except:
+            return None
 
-                # Don't blunder if we're already losing by 3+ points
-                if current_eval < -300:
-                    return True
+    def get_opponent_time_remaining(self):
+        """Get opponent's time remaining"""
+        try:
+            if hasattr(self.grabber, 'get_player_time'):
+                return self.grabber.get_player_time(not self.is_white)
+            return None
+        except:
+            return None
 
-            # Don't blunder in very early opening (first 8 moves)
-            move_count = len(board.move_stack)
-            if move_count < 8:
-                return True
+    def detect_time_control(self):
+        """Detect game time control based on initial time"""
+        try:
+            if self.initial_time is None:
+                self.initial_time = self.get_time_remaining()
 
-            # Don't blunder when in check
-            if board.is_check():
-                return True
+            if self.initial_time:
+                # Convert to seconds if needed
+                if self.initial_time < 180:  # Less than 3 minutes
+                    self.time_control_type = "bullet"
+                elif self.initial_time < 600:  # Less than 10 minutes
+                    self.time_control_type = "blitz"
+                else:
+                    self.time_control_type = "rapid"
+            else:
+                # Default to blitz if we can't detect
+                self.time_control_type = "blitz"
 
-            # Don't blunder if only a few legal moves (forced positions)
-            if len(list(board.legal_moves)) <= 2:
-                return True
+        except:
+            self.time_control_type = "blitz"
 
-            # Don't blunder if mate is imminent (either way)
-            top_moves = stockfish.get_top_moves(1)
-            if top_moves and 'Mate' in top_moves[0]:
-                mate_in = abs(top_moves[0].get('Mate', 0))
-                if mate_in <= 3:
-                    return True
+    def update_time_pressure_state(self):
+        """Update our time pressure state - ENHANCED for human-like panic"""
+        try:
+            time_remaining = self.get_time_remaining()
+            if time_remaining is None:
+                return
 
-            return False
+            # Different thresholds for different time controls
+            if self.time_control_type == "bullet":
+                self.critical_time_pressure = time_remaining < 5  # Less than 5 seconds - PANIC!
+                self.severe_time_pressure = time_remaining < 10  # Less than 10 seconds
+                self.in_time_pressure = time_remaining < 30  # Less than 30 seconds
+            elif self.time_control_type == "blitz":
+                self.critical_time_pressure = time_remaining < 10  # Less than 10 seconds - PANIC!
+                self.severe_time_pressure = time_remaining < 20  # Less than 20 seconds
+                self.in_time_pressure = time_remaining < 60  # Less than 1 minute
+            else:  # rapid
+                self.critical_time_pressure = time_remaining < 15  # Less than 15 seconds - PANIC!
+                self.severe_time_pressure = time_remaining < 30  # Less than 30 seconds
+                self.in_time_pressure = time_remaining < 120  # Less than 2 minutes
+
+            # Track consecutive moves in time pressure
+            if self.in_time_pressure:
+                self.moves_in_time_pressure += 1
+            else:
+                self.moves_in_time_pressure = 0
+
+            # Update opponent time pressure
+            opp_time = self.get_opponent_time_remaining()
+            if opp_time and self.time_control_type == "bullet":
+                self.opponent_time_pressure = opp_time < 20
+            elif opp_time and self.time_control_type == "blitz":
+                self.opponent_time_pressure = opp_time < 40
+
+        except:
+            pass
+
+    def should_force_error_now(self, board, move_count, stockfish):
+        """
+        ENHANCED: Determine if we should force any type of error (inaccuracy/mistake/blunder)
+        """
+        if not self.enable_errors:
+            return None
+
+        # Don't make errors in critical time pressure
+        if self.critical_time_pressure:
+            return None
+
+        # Too soon after last error
+        if move_count - self.last_error_move < self.error_cooldown:
+            return None
+
+        # Don't error in very early opening
+        if move_count < 5:
+            return None
+
+        # Check each error type
+        for error_type in ['blunder', 'mistake', 'inaccuracy']:
+            if self.errors_this_game[error_type] >= self.errors_per_game[error_type]:
+                continue
+
+            # Calculate if we're behind schedule for this error type
+            expected_game_length = 45  # Average game length
+            expected_errors = (move_count / expected_game_length) * self.errors_per_game[error_type]
+            error_deficit = expected_errors - self.errors_this_game[error_type]
+
+            if error_deficit > 0.3:  # Behind schedule
+                # Base probability based on error type and deficit
+                if error_type == 'inaccuracy':
+                    base_prob = min(0.25, error_deficit * 0.15)
+                elif error_type == 'mistake':
+                    base_prob = min(0.20, error_deficit * 0.12)
+                else:  # blunder
+                    base_prob = min(0.15, error_deficit * 0.10)
+
+                # Modifiers
+                error_chance = base_prob
+
+                # More errors when winning (overconfidence)
+                if self.we_are_winning_big:
+                    error_chance *= 1.5
+
+                # More errors after many good moves (complacency)
+                if self.consecutive_good_moves > 5:
+                    error_chance *= 1.3
+
+                # More errors in time pressure (but not critical)
+                if self.in_time_pressure and not self.severe_time_pressure:
+                    error_chance *= 1.4
+
+                # Less errors when losing badly
+                try:
+                    eval_data = stockfish.get_evaluation()
+                    if eval_data and eval_data['type'] == 'cp':
+                        current_eval = eval_data['value']
+                        if not board.turn:
+                            current_eval = -current_eval
+                        if current_eval < -300:
+                            error_chance *= 0.5
+                except:
+                    pass
+
+                # Roll the dice
+                if random.random() < error_chance:
+                    print(f"🎲 Forcing {error_type}: {error_chance:.2%} chance hit!")
+                    return error_type
+
+        return None
+
+    def calculate_thinking_time(self, board, move, move_count, stockfish=None):
+        """
+        ULTRA-ENHANCED human-like thinking with FASTER average play
+        """
+        if not self.enable_human_delays:
+            return 0.1
+
+        # Update time pressure state
+        self.update_time_pressure_state()
+
+        # CRITICAL TIME PRESSURE - Ultra fast moves to avoid flagging
+        if self.critical_time_pressure:
+            # Exponentially faster as time runs out
+            time_left = self.get_time_remaining() or 5
+            if time_left < 2:
+                panic_time = 0.05  # Near instant
+            elif time_left < 5:
+                panic_time = random.uniform(0.05, 0.1)
+            else:
+                panic_time = random.uniform(0.1, 0.2)
+            print(f"🚨🚨 CRITICAL TIME: {panic_time:.1f}s (only {time_left:.1f}s left!)")
+            return panic_time
+
+        # SEVERE TIME PRESSURE
+        if self.severe_time_pressure:
+            # Still panic but with slight variation
+            panic_time = random.uniform(0.2, 0.5)
+            # Even faster if we've been in time pressure for many moves
+            if self.moves_in_time_pressure > 5:
+                panic_time *= 0.5
+            print(f"🚨 SEVERE TIME PRESSURE: {panic_time:.1f}s")
+            return panic_time
+
+        # ERROR THINKING PATTERNS - Keep as is
+        if self.force_error_this_move:
+            # Different thinking patterns for different errors
+            if self.force_error_this_move == 'inaccuracy':
+                # Quick oversight
+                error_time = random.uniform(0.8, 2.5)
+                print(f"😕 Inaccuracy thinking: {error_time:.1f}s")
+            elif self.force_error_this_move == 'mistake':
+                # Miscalculation after some thought
+                error_time = random.uniform(2.0, 5.0)
+                print(f"😣 Mistake thinking: {error_time:.1f}s")
+            else:  # blunder
+                # Often happens after "deep" calculation
+                if random.random() < 0.3:
+                    error_time = random.uniform(1.5, 3.0)  # Quick blunder
+                else:
+                    error_time = random.uniform(4.0, 10.0)  # Calculated blunder
+                print(f"🤯 Blunder thinking: {error_time:.1f}s")
+            return error_time
+
+        # ============ INSTANT REACTIONS (0.05-0.15s) ============
+
+        # Pre-moves and instant recaptures - TRULY INSTANT
+        if move and self.last_opponent_move:
+            if self.is_obvious_recapture(board, move):
+                thinking_time = random.uniform(0.05, 0.15)
+                print(f"⚡⚡ INSTANT recapture: {thinking_time:.1f}s")
+                return thinking_time
+
+        # ============ VERY FAST MOVES (0.1-0.3s) ============
+
+        # Opening moves - MUCH FASTER throughout opening
+        if self.is_opening_phase(move_count):
+            # First 6 moves almost instant
+            if move_count < 6:
+                thinking_time = random.uniform(0.05, 0.15)
+                print(f"⚡⚡ Early opening blitz: {thinking_time:.1f}s")
+                return thinking_time
+            # Moves 6-15 still very fast
+            elif move_count < 15:
+                thinking_time = random.uniform(0.1, 0.3)
+                print(f"⚡ Opening theory: {thinking_time:.1f}s")
+                return thinking_time
+            # Late opening still quick
+            else:
+                thinking_time = random.uniform(0.2, 0.5)
+                print(f"📖 Late opening: {thinking_time:.1f}s")
+                return thinking_time
+
+        # Natural development moves - INSTANT
+        if self.is_piece_development_move(board, move, move_count):
+            thinking_time = random.uniform(0.05, 0.2)
+            print(f"🏃‍♂️ Natural development: {thinking_time:.1f}s")
+            return thinking_time
+
+        # Castling - VERY FAST
+        if move and self.is_obvious_castling(board, move):
+            thinking_time = random.uniform(0.05, 0.2)
+            print(f"🏰 Instant castling: {thinking_time:.1f}s")
+            return thinking_time
+
+        # Only legal move - INSTANT
+        if self.is_forced_move(board):
+            thinking_time = random.uniform(0.05, 0.1)
+            print(f"🎯 Only move: {thinking_time:.1f}s")
+            return thinking_time
+
+        # Check escapes - VERY FAST
+        if self.is_check_escape_only(board):
+            thinking_time = random.uniform(0.1, 0.3)
+            print(f"👑 Check escape: {thinking_time:.1f}s")
+            return thinking_time
+
+        # Free piece captures - INSTANT
+        if move and self.is_free_piece_capture(board, move):
+            thinking_time = random.uniform(0.05, 0.2)
+            print(f"🎁 Free piece grab: {thinking_time:.1f}s")
+            return thinking_time
+
+        # Obvious promotions - FAST
+        if move and self.is_promotion_to_queen(move):
+            thinking_time = random.uniform(0.1, 0.3)
+            print(f"👸 Queen promotion: {thinking_time:.1f}s")
+            return thinking_time
+
+        # Simple captures of hanging pieces - FAST
+        if move and self.is_piece_hanging_obviously(board, move):
+            thinking_time = random.uniform(0.1, 0.3)
+            print(f"🎯 Hanging piece: {thinking_time:.1f}s")
+            return thinking_time
+
+        # Fork followup captures - INSTANT
+        if move and self.is_fork_followup(board, move):
+            thinking_time = random.uniform(0.05, 0.15)
+            print(f"🍴 Fork collection: {thinking_time:.1f}s")
+            return thinking_time
+
+        # Mate in 1 - SLIGHT PAUSE FOR DRAMA
+        if move and self.is_mate_in_one(board, move):
+            thinking_time = random.uniform(0.3, 0.8)
+            print(f"♟️ Checkmate!: {thinking_time:.1f}s")
+            return thinking_time
+
+        # ============ COMPLEX POSITION ANALYSIS - FASTER BASE TIMES ============
+
+        # Get max thinking time based on time control and remaining time
+        effective_max_time = self.get_effective_max_thinking_time()
+
+        if stockfish:
+            try:
+                candidate_count = self.count_candidate_moves(board, stockfish)
+                position_complexity = self.analyze_position_complexity(board, move_count)
+                eval_spread = self.get_evaluation_spread(stockfish)
+
+                # FASTER BASE RANGES for normal moves
+                if candidate_count <= 1:
+                    base_range = (0.2, 0.5)  # Reduced from (0.4, 1.2)
+                    complexity_label = "Only move"
+                elif candidate_count <= 2:
+                    base_range = (0.4, 1.5)  # Reduced from (0.8, 3.0)
+                    complexity_label = f"Few options ({candidate_count})"
+                elif candidate_count <= 4:
+                    base_range = (0.8, 5.0)  # Reduced from (2.0, 10.0)
+                    complexity_label = f"Several options ({candidate_count})"
+                else:
+                    # Many candidates - still allow deep thinks but less common
+                    if eval_spread < 30:  # Very close evaluations
+                        base_range = (3.0, effective_max_time)  # Reduced from (8.0, max)
+                        complexity_label = f"VERY complex! ({candidate_count} similar moves)"
+                    elif eval_spread < 60:
+                        base_range = (2.0, effective_max_time * 0.5)  # Reduced
+                        complexity_label = f"Complex ({candidate_count} options)"
+                    else:
+                        base_range = (1.0, 6.0)  # Reduced from (3.0, 12.0)
+                        complexity_label = f"Many options ({candidate_count})"
+
+                # Sample thinking time with realistic distribution
+                thinking_time = self.sample_thinking_time_complex(base_range, eval_spread)
+
+                # Apply modifiers
+                thinking_time *= position_complexity
+                thinking_time = self.add_psychological_delay(thinking_time)
+                thinking_time = self.add_thinking_variance(thinking_time)
+
+                print(f"🧠 {complexity_label}: {thinking_time:.1f}s")
+
+            except Exception as e:
+                print(f"Error in analysis: {e}")
+                thinking_time = random.uniform(0.5, 2.0)  # Reduced fallback
+        else:
+            thinking_time = random.uniform(0.5, 2.0)  # Reduced fallback
+
+        # Time pressure override - MORE AGGRESSIVE
+        if self.in_time_pressure:
+            max_allowed = 1.0 if not self.severe_time_pressure else 0.5
+            thinking_time = min(thinking_time, max_allowed)
+            print(f"⏰ Time pressure cap: {max_allowed}s")
+
+        # Final bounds
+        thinking_time = max(0.05, min(thinking_time, effective_max_time))
+
+        # Track patterns
+        self.last_thinking_times.append(thinking_time)
+        if len(self.last_thinking_times) > 10:
+            self.last_thinking_times.pop(0)
+
+        return round(thinking_time, 1)
+
+    def sample_thinking_time_complex(self, time_range, eval_spread):
+        """Enhanced sampling for complex positions - FASTER BIAS"""
+        min_time, max_time = time_range
+
+        # For very complex positions, still allow deep thinks but less often
+        if eval_spread < 30 and max_time > 15:
+            # Only 20% chance of deep think (reduced from 40%)
+            if random.random() < 0.2:
+                return random.uniform(max_time * 0.6, max_time)
+
+        # Normal distribution - bias toward faster times
+        if random.random() < 0.7:
+            # Beta distribution biased toward lower values
+            beta_sample = random.betavariate(2, 5)
+            return min_time + beta_sample * (max_time - min_time) * 0.3  # Reduced from 0.5
+        else:
+            # Uniform distribution weighted toward lower half
+            if random.random() < 0.7:
+                return random.uniform(min_time, min_time + (max_time - min_time) * 0.5)
+            else:
+                return random.uniform(min_time, max_time)
+
+    def get_effective_max_thinking_time(self):
+        """Get maximum thinking time based on time control and remaining time"""
+        # Base max times by time control
+        if self.time_control_type == "bullet":
+            base_max = self.bullet_max_time
+        elif self.time_control_type == "blitz":
+            base_max = self.blitz_max_time
+        else:
+            base_max = self.rapid_max_time
+
+        # Adjust based on remaining time
+        time_remaining = self.get_time_remaining()
+        if time_remaining:
+            # Scale down as time decreases
+            if time_remaining < 30:
+                time_factor = 0.05  # Very conservative
+            elif time_remaining < 60:
+                time_factor = 0.1
+            elif time_remaining < 120:
+                time_factor = 0.15
+            else:
+                time_factor = 0.2  # Never use more than 20% of time
+
+            time_based_max = time_remaining * time_factor
+
+            # But ensure minimum thinking time unless critical
+            if not self.severe_time_pressure:
+                time_based_max = max(0.5, time_based_max)  # Reduced from 1.0
+
+            return min(base_max, time_based_max)
+
+        return base_max
+
+    def select_human_like_move(self, stockfish, board, move_count):
+        """
+        Enhanced human-like move selection with complete error system
+        """
+        if not self.human_accuracy:
+            return stockfish.get_best_move()
+
+        try:
+            # Update psychological state
+            self.update_game_psychology(board, stockfish)
+
+            # Check if we should force an error this move
+            error_type = self.should_force_error_now(board, move_count, stockfish)
+            if error_type:
+                self.force_error_this_move = error_type
+                error_move = self.select_error_move(stockfish, board, move_count, error_type)
+                self.update_error_state(move_count, error_type)
+                self.force_error_this_move = None
+                return error_move
+
+            # Get top moves
+            top_moves = stockfish.get_top_moves(10)
+            if not top_moves or len(top_moves) == 0:
+                return stockfish.get_best_move()
+
+            if len(top_moves) == 1:
+                return top_moves[0]['Move']
+
+            best_move = top_moves[0]
+            best_eval = best_move.get('Centipawn', 0)
+            best_move_uci = best_move['Move']
+
+            # Critical positions - always play best
+            if 'Mate' in best_move and best_move.get('Mate', 0) <= 2:
+                print("🚨 Mate in 1-2 - playing best move")
+                return best_move_uci
+
+            # Time pressure override - play faster, not necessarily best
+            if self.severe_time_pressure:
+                # Just play a reasonable move quickly
+                max_candidates = 3
+                quick_candidates = top_moves[:max_candidates]
+                weights = [0.6, 0.3, 0.1][:len(quick_candidates)]
+                selected = random.choices(quick_candidates, weights=weights)[0]['Move']
+                print(f"⏰ Time pressure move: {selected}")
+                return selected
+
+            # Build candidate list
+            candidate_moves = []
+
+            # Dynamic threshold based on rating/skill
+            # Higher skill = tighter threshold
+            if self.skill_level <= 5:
+                base_threshold = 100
+            elif self.skill_level <= 10:
+                base_threshold = 75
+            elif self.skill_level <= 15:
+                base_threshold = 50
+            else:
+                base_threshold = 30
+
+            # Psychology adjustments
+            if self.just_blundered:
+                base_threshold *= 0.7  # More careful
+            elif self.we_are_winning_big:
+                base_threshold *= 1.5  # More sloppy
+            elif self.in_time_pressure:
+                base_threshold *= 1.3  # More errors under pressure
+
+            # Build candidates
+            for i, move in enumerate(top_moves):
+                move_eval = move.get('Centipawn', 0)
+                eval_diff = abs(best_eval - move_eval)
+
+                if i == 0:  # Always include best
+                    candidate_moves.append(move)
+                elif eval_diff <= base_threshold:
+                    candidate_moves.append(move)
+                    print(f"🎲 Candidate {len(candidate_moves)}: {move['Move']} (-{eval_diff}cp)")
+                elif eval_diff > base_threshold * 3:
+                    break
+
+            # Selection with realistic weights
+            if len(candidate_moves) == 1:
+                selected_move = candidate_moves[0]['Move']
+            else:
+                # Weight distribution for more realistic play
+                # Not always picking the best move
+                if len(candidate_moves) == 2:
+                    weights = [0.70, 0.30]  # 70% best, 30% second
+                elif len(candidate_moves) == 3:
+                    weights = [0.55, 0.30, 0.15]
+                elif len(candidate_moves) == 4:
+                    weights = [0.45, 0.25, 0.20, 0.10]
+                else:
+                    # Distribute weights with bias toward better moves
+                    weights = []
+                    remaining = 1.0
+                    for i in range(len(candidate_moves)):
+                        if i == 0:
+                            w = 0.40
+                        elif i < 3:
+                            w = 0.20
+                        else:
+                            w = remaining / (len(candidate_moves) - i)
+                        weights.append(w)
+                        remaining -= w
+
+                selected_move = random.choices(candidate_moves, weights=weights)[0]['Move']
+
+            return selected_move
 
         except Exception as e:
-            print(f"Error checking critical position: {e}")
-            return True  # Be safe, don't blunder if we can't evaluate
+            print(f"Error in move selection: {e}")
+            return stockfish.get_best_move()
 
-    def select_blunder_move(self, stockfish, board, move_count):
+    def select_error_move(self, stockfish, board, move_count, error_type):
         """
-        Select a move that constitutes a realistic blunder
+        Select a move that constitutes the specified error type
         """
         try:
-            print("🤯 SELECTING BLUNDER MOVE...")
+            print(f"🎯 Selecting {error_type.upper()} move...")
 
-            # Get top moves to understand what we're avoiding
-            top_moves = stockfish.get_top_moves(8)
+            top_moves = stockfish.get_top_moves(12)  # Get more moves for variety
             if not top_moves or len(top_moves) < 2:
-                print("❌ Not enough moves to blunder - playing best")
                 return top_moves[0]['Move'] if top_moves else stockfish.get_best_move()
 
             best_move = top_moves[0]
             best_eval = best_move.get('Centipawn', 0)
 
-            # Find moves that are significantly worse but not completely insane
-            blunder_candidates = []
+            # Get error severity range
+            min_loss, max_loss = self.error_severity[error_type]
+
+            # Find candidate moves in the error range
+            error_candidates = []
 
             for i, move in enumerate(top_moves[1:], 1):
                 move_eval = move.get('Centipawn', 0)
                 eval_loss = best_eval - move_eval
 
-                # Look for moves that lose between blunder_severity and blunder_severity*2 centipawns
-                min_loss = self.blunder_severity
-                max_loss = self.blunder_severity * 2
-
                 if min_loss <= eval_loss <= max_loss:
-                    # Make sure it's not a mate blunder
+                    # Don't pick mate blunders unless it's a distant mate
                     if 'Mate' not in move or abs(move.get('Mate', 0)) > 10:
-                        blunder_candidates.append({
+                        error_candidates.append({
                             'move': move['Move'],
                             'eval_loss': eval_loss,
                             'rank': i
                         })
 
-            # If no good blunder candidates in top moves, look at more moves
-            if not blunder_candidates:
-                print("🔍 Looking for blunder in lower-ranked moves...")
+            # If no candidates in range, adjust the range slightly
+            if not error_candidates and len(top_moves) > 3:
+                adjusted_min = min_loss * 0.7
+                adjusted_max = max_loss * 1.3
 
-                # Get all legal moves and evaluate a few more
-                legal_moves = list(board.legal_moves)
-                random.shuffle(legal_moves)
+                for i, move in enumerate(top_moves[1:], 1):
+                    move_eval = move.get('Centipawn', 0)
+                    eval_loss = best_eval - move_eval
 
-                for chess_move in legal_moves[:10]:  # Check 10 random legal moves
-                    move_uci = chess_move.uci()
+                    if adjusted_min <= eval_loss <= adjusted_max:
+                        error_candidates.append({
+                            'move': move['Move'],
+                            'eval_loss': eval_loss,
+                            'rank': i
+                        })
 
-                    # Skip if this move is in our top moves already
-                    if any(tm['Move'] == move_uci for tm in top_moves):
-                        continue
+            # Select from candidates
+            if error_candidates:
+                # Prefer errors closer to the minimum loss (more realistic)
+                error_candidates.sort(key=lambda x: abs(x['eval_loss'] - min_loss))
 
-                    # Quick evaluation of this move
-                    temp_board = board.copy()
-                    temp_board.push(chess_move)
-
-                    # Simple heuristic blunder detection
-                    if board.is_capture(chess_move):
-                        captured_piece = board.piece_at(chess_move.to_square)
-                        our_piece = board.piece_at(chess_move.from_square)
-
-                        if captured_piece and our_piece:
-                            # Check if it's a bad trade
-                            material_diff = self.get_piece_value(captured_piece.piece_type) - self.get_piece_value(
-                                our_piece.piece_type)
-
-                            # Bad trade = potential blunder
-                            if -3 <= material_diff <= -1:  # Losing 1-3 points of material
-                                blunder_candidates.append({
-                                    'move': move_uci,
-                                    'eval_loss': abs(material_diff) * 100,  # Convert to centipawns
-                                    'rank': 99,
-                                    'type': 'bad_trade'
-                                })
-                                break
-
-            # Select from blunder candidates
-            if blunder_candidates:
-                # Prefer milder blunders (closer to min loss)
-                blunder_candidates.sort(key=lambda x: x['eval_loss'])
-
-                # Weight selection toward smaller blunders (more realistic)
-                if len(blunder_candidates) == 1:
-                    selected = blunder_candidates[0]
-                elif len(blunder_candidates) == 2:
-                    weights = [0.7, 0.3]
-                    selected = random.choices(blunder_candidates, weights=weights)[0]
+                # Weight selection
+                if len(error_candidates) == 1:
+                    selected = error_candidates[0]
                 else:
-                    # More weight on smaller blunders
-                    weights = [0.5, 0.3, 0.2] + [0.1] * (len(blunder_candidates) - 3)
-                    weights = weights[:len(blunder_candidates)]
-                    selected = random.choices(blunder_candidates, weights=weights)[0]
+                    # Exponential weights favoring smaller errors
+                    weights = [0.5 ** i for i in range(len(error_candidates))]
+                    total = sum(weights)
+                    weights = [w / total for w in weights]
+                    selected = random.choices(error_candidates, weights=weights)[0]
 
-                print(f"💥 BLUNDER SELECTED: {selected['move']} (loses {selected['eval_loss']}cp)")
+                print(f"💥 {error_type.upper()}: {selected['move']} (loses {selected['eval_loss']}cp)")
 
-                # Log this blunder
-                self.game_blunder_log.append({
+                # Log the error
+                self.game_error_log.append({
                     'move_number': move_count,
                     'move': selected['move'],
                     'eval_loss': selected['eval_loss'],
-                    'type': selected.get('type', 'positional')
+                    'type': error_type
                 })
 
                 return selected['move']
 
-            # Fallback: just pick the 3rd or 4th best move
-            print("🎲 Fallback blunder: selecting lower-ranked move")
-            fallback_index = min(3, len(top_moves) - 1)
-            selected_move = top_moves[fallback_index]['Move']
-            eval_loss = best_eval - top_moves[fallback_index].get('Centipawn', 0)
+            # Fallback - just play a suboptimal move
+            fallback_rank = {
+                'inaccuracy': min(2, len(top_moves) - 1),
+                'mistake': min(3, len(top_moves) - 1),
+                'blunder': min(4, len(top_moves) - 1)
+            }
 
-            print(f"💥 FALLBACK BLUNDER: {selected_move} (loses ~{eval_loss}cp)")
-
-            self.game_blunder_log.append({
-                'move_number': move_count,
-                'move': selected_move,
-                'eval_loss': eval_loss,
-                'type': 'fallback'
-            })
+            selected_move = top_moves[fallback_rank[error_type]]['Move']
+            print(f"💥 Fallback {error_type}: {selected_move}")
 
             return selected_move
 
         except Exception as e:
-            print(f"Error selecting blunder move: {e}")
-            # Safe fallback
+            print(f"Error selecting {error_type}: {e}")
             return stockfish.get_best_move()
 
-    def update_blunder_state(self, move_count):
-        """
-        Update blunder-related state after making a blunder
-        """
-        self.blunders_this_game += 1
-        self.last_blunder_move = move_count
-        self.just_blundered = True
-        self.consecutive_good_moves = 0
-        self.our_confidence_level *= 0.5  # Confidence crash after blunder
+    def update_error_state(self, move_count, error_type):
+        """Update error tracking after making an error"""
+        self.errors_this_game[error_type] += 1
+        self.last_error_move = move_count
 
-        print(f"📊 BLUNDER #{self.blunders_this_game}/{self.blunders_per_game} this game")
+        if error_type == 'blunder':
+            self.just_blundered = True
+            self.consecutive_good_moves = 0
+            self.our_confidence_level *= 0.5
+        elif error_type == 'mistake':
+            self.consecutive_good_moves = 0
+            self.our_confidence_level *= 0.7
+        else:  # inaccuracy
+            self.consecutive_good_moves = max(0, self.consecutive_good_moves - 2)
+            self.our_confidence_level *= 0.9
 
-    def log_blunder_summary(self):
-        """
-        Log summary of blunders made this game
-        """
-        if self.game_blunder_log:
-            print("\n🎯 BLUNDER SUMMARY THIS GAME:")
-            for i, blunder in enumerate(self.game_blunder_log, 1):
-                print(f"  Blunder {i}: Move {blunder['move_number']} - {blunder['move']} "
-                      f"(lost {blunder['eval_loss']}cp, type: {blunder['type']})")
-            avg_loss = sum(b['eval_loss'] for b in self.game_blunder_log) / len(self.game_blunder_log)
-            print(f"  Average blunder severity: {avg_loss:.0f}cp")
+        total_errors = sum(self.errors_this_game.values())
+        print(f"📊 Error #{self.errors_this_game[error_type]} ({error_type}) - Total errors: {total_errors}")
+
+    def log_error_summary(self):
+        """Log summary of all errors made this game"""
+        if self.game_error_log:
+            print("\n🎯 ERROR SUMMARY THIS GAME:")
+            error_counts = { 'inaccuracy': 0, 'mistake': 0, 'blunder': 0 }
+            total_loss = 0
+
+            for i, error in enumerate(self.game_error_log, 1):
+                print(f"  Error {i}: Move {error['move_number']} - {error['move']} "
+                      f"({error['type']}, lost {error['eval_loss']}cp)")
+                error_counts[error['type']] += 1
+                total_loss += error['eval_loss']
+
+            print(f"\n  Totals: {error_counts['inaccuracy']} inaccuracies, "
+                  f"{error_counts['mistake']} mistakes, {error_counts['blunder']} blunders")
+            print(f"  Average error severity: {total_loss / len(self.game_error_log):.0f}cp")
+            print(f"  Total evaluation lost: {total_loss}cp")
         else:
-            print("🎯 No blunders made this game!")
+            print("🎯 Perfect game - no errors!")
+
+    def add_thinking_variance(self, base_time):
+        """Add natural variance to avoid detectable patterns - ADJUSTED FOR FASTER PLAY"""
+        # Avoid too many similar thinking times
+        if len(self.last_thinking_times) >= 3:
+            recent_avg = sum(self.last_thinking_times[-3:]) / 3
+            if abs(base_time - recent_avg) < 0.3:  # Reduced from 0.5
+                # Add more variance if times are too similar
+                variance_factor = random.choice([0.5, 0.6, 1.2, 1.3])  # Reduced range
+                base_time *= variance_factor
+                print(f"🎲 Pattern breaker: x{variance_factor}")
+
+        # Occasional random spikes or dips - less extreme
+        if random.random() < 0.08:  # Reduced from 10% to 8%
+            if random.random() < 0.6:  # Bias toward quick moves
+                # Quick move
+                base_time *= random.uniform(0.3, 0.5)
+                print("⚡ Random quick move")
+            else:
+                # Deep think - less extreme
+                base_time *= random.uniform(1.3, 1.8)  # Reduced from 2.0
+                print("🤔 Random deep think")
+
+        return base_time
+
+    def get_evaluation_spread(self, stockfish):
+        """Get the spread of evaluations among top moves"""
+        try:
+            top_moves = stockfish.get_top_moves(5)
+            if not top_moves or len(top_moves) < 2:
+                return 1000  # High spread if we can't determine
+
+            evaluations = []
+            for move in top_moves:
+                if 'Centipawn' in move:
+                    evaluations.append(move['Centipawn'])
+
+            if len(evaluations) >= 2:
+                return max(evaluations) - min(evaluations)
+            return 1000
+        except:
+            return 1000
 
     def is_opening_phase(self, move_count):
         """Check if we're still in opening phase"""
         return move_count < 20  # Extended opening phase
 
     def is_early_opening(self, move_count):
-        """First few moves should be lightning fast"""
-        return move_count < 10  # Extended early opening
+        """First moves should be lightning fast"""
+        return move_count < 6  # Reduced from 10 for truly early opening
 
     def is_obvious_castling(self, board, move):
         """Castling is usually a quick decision"""
@@ -352,7 +853,7 @@ class StockfishBot(multiprocessing.Process):
 
     def is_piece_development_move(self, board, move, move_count):
         """Early piece development should be very fast"""
-        if move_count > 12:  # Only in opening
+        if move_count > 15:  # Extended from 12
             return False
 
         try:
@@ -376,7 +877,20 @@ class StockfishBot(multiprocessing.Process):
             # Central pawn moves in opening
             if piece.piece_type == chess.PAWN:
                 target_square = chess.square_name(chess_move.to_square)
-                if target_square in ['e4', 'e5', 'd4', 'd5', 'c4', 'c5']:
+                if target_square in ['e4', 'e5', 'd4', 'd5', 'c4', 'c5', 'f4', 'f5']:
+                    return True
+
+            # Rook to open file (after castling)
+            if piece.piece_type == chess.ROOK and move_count > 10:
+                # Check if moving to an open or semi-open file
+                file_idx = chess.square_file(chess_move.to_square)
+                file_is_open = True
+                for rank in range(8):
+                    square = chess.square(file_idx, rank)
+                    if board.piece_at(square) and board.piece_at(square).piece_type == chess.PAWN:
+                        file_is_open = False
+                        break
+                if file_is_open:
                     return True
 
         except:
@@ -464,7 +978,7 @@ class StockfishBot(multiprocessing.Process):
         return False
 
     def is_obvious_recapture(self, board, move):
-        """Enhanced recapture detection"""
+        """Enhanced recapture detection - TRULY INSTANT"""
         if not self.last_opponent_move:
             return False
 
@@ -474,14 +988,8 @@ class StockfishBot(multiprocessing.Process):
 
             # If opponent captured and we're capturing back on same square
             if board.is_capture(last_move) and current_move.to_square == last_move.to_square:
-                # Even more obvious if it's an equal or favorable trade
-                captured_piece = board.piece_at(current_move.to_square)
-                our_piece = board.piece_at(current_move.from_square)
-
-                if captured_piece and our_piece:
-                    # Equal or better trade = very obvious
-                    if self.get_piece_value(captured_piece.piece_type) >= self.get_piece_value(our_piece.piece_type):
-                        return True
+                # ALWAYS instant recapture - realistic human behavior
+                return True
 
             return False
         except:
@@ -688,32 +1196,32 @@ class StockfishBot(multiprocessing.Process):
             return min(6, len(list(board.legal_moves)))
 
     def analyze_position_complexity(self, board, move_count):
-        """Analyze position complexity and return thinking time modifier"""
+        """Analyze position complexity and return thinking time modifier - ADJUSTED FOR FASTER PLAY"""
         try:
             complexity_score = 1.0
 
             # Piece count affects complexity
             piece_count = len(board.piece_map())
             if piece_count > 20 and move_count > 10:
-                complexity_score *= 1.1
+                complexity_score *= 1.05  # Reduced from 1.1
             elif piece_count < 10:  # Endgame
-                complexity_score *= 1.4  # Endgames need precision
+                complexity_score *= 1.2  # Reduced from 1.4
 
             # Tactical indicators
             if board.is_check():
-                complexity_score *= 1.3
+                complexity_score *= 1.2  # Reduced from 1.3
 
             # Lots of captures available = more tactical
             legal_moves = list(board.legal_moves)
             capture_moves = [m for m in legal_moves if board.is_capture(m)]
             if len(capture_moves) > 3:
-                complexity_score *= 1.2
+                complexity_score *= 1.1  # Reduced from 1.2
 
-            # Opening simplification - NEW: Much faster opening play
+            # Opening simplification - MUCH FASTER
             if move_count < 20:
-                complexity_score *= 0.4  # Opening moves much faster (was 0.5)
+                complexity_score *= 0.2  # Very fast opening play (was 0.4)
 
-            return max(0.2, min(2.0, complexity_score))
+            return max(0.1, min(1.5, complexity_score))  # Reduced max from 2.0
 
         except:
             return 1.0
@@ -823,14 +1331,14 @@ class StockfishBot(multiprocessing.Process):
 
                 # Did we just blunder? (Updated to work with intentional blunders)
                 eval_loss = self.previous_evaluation - current_eval
-                if eval_loss > 200 and not self.force_blunder_this_move:
+                if eval_loss > 200 and not self.force_error_this_move:
                     self.just_blundered = True
                     self.consecutive_good_moves = 0
                     self.our_confidence_level *= 0.7  # Confidence drops after blunder
                     self.recent_blunder_moves.append(len(board.move_stack))
                 else:
                     # Don't count intentional blunders as "just_blundered"
-                    if not self.force_blunder_this_move:
+                    if not self.force_error_this_move:
                         self.just_blundered = False
 
                 # Are we "in the zone"?
@@ -850,54 +1358,55 @@ class StockfishBot(multiprocessing.Process):
             pass
 
     def add_psychological_delay(self, base_time):
-        """Add psychological factors to thinking time"""
+        """Add psychological factors to thinking time - ADJUSTED FOR FASTER PLAY"""
         psychological_time = base_time
 
-        # If we just blundered, we're more careful
+        # If we just blundered, we're more careful (but not too slow)
         if self.just_blundered:
-            psychological_time *= random.uniform(1.5, 2.0)
+            psychological_time *= random.uniform(1.3, 1.7)  # Reduced from (1.5, 2.0)
             print("😰 Post-blunder caution")
 
         # If we're winning big, we might play faster (overconfidence)
         if self.we_are_winning_big:
-            psychological_time *= random.uniform(0.6, 0.8)
+            psychological_time *= random.uniform(0.5, 0.7)  # Even faster when winning
             print("😎 Winning confidence boost")
 
         # If we're in the zone, smooth rhythm
         if self.consecutive_good_moves > 5:
-            psychological_time *= random.uniform(0.7, 0.9)
+            psychological_time *= random.uniform(0.6, 0.8)  # Faster in the zone
             print("🎯 In the zone!")
 
-        # Complex positions make us think longer
+        # Complex positions make us think longer (but not too much)
         if self.complex_position_streak > 2:
-            psychological_time *= random.uniform(1.3, 1.7)
+            psychological_time *= random.uniform(1.2, 1.5)  # Reduced from (1.3, 1.7)
             print("🤯 Complex position fatigue")
 
         # Apply confidence level
-        psychological_time *= (2.0 - self.our_confidence_level)
+        psychological_time *= (1.5 - self.our_confidence_level * 0.5)  # Adjusted formula
 
         return psychological_time
 
     def simulate_mouse_hesitation(self, move):
-        """Simulate human mouse movement patterns"""
+        """Simulate human mouse movement patterns - FASTER VERSION"""
         if not self.enable_human_delays:
             return
 
         start_pos, end_pos = self.get_move_pos(move)
 
+        # Less hesitation overall for faster play
         # Sometimes hover over the piece before grabbing
-        if random.random() < 0.3:
+        if random.random() < 0.2:  # Reduced from 0.3
             hover_x = start_pos[0] + random.randint(-5, 5)
             hover_y = start_pos[1] + random.randint(-5, 5)
-            pyautogui.moveTo(hover_x, hover_y, duration=0.1)
-            time.sleep(random.uniform(0.05, 0.15))
+            pyautogui.moveTo(hover_x, hover_y, duration=0.05)
+            time.sleep(random.uniform(0.03, 0.08))  # Reduced times
 
-        # Occasionally almost grab wrong piece
-        if random.random() < 0.05 and not self.is_forced_move(chess.Board()):
+        # Rarely almost grab wrong piece (only when not in time pressure)
+        if random.random() < 0.03 and not self.is_forced_move(chess.Board()) and not self.in_time_pressure:
             wrong_x = start_pos[0] + random.choice([-50, 50])
             wrong_y = start_pos[1] + random.choice([-50, 50])
-            pyautogui.moveTo(wrong_x, wrong_y, duration=0.2)
-            time.sleep(0.1)
+            pyautogui.moveTo(wrong_x, wrong_y, duration=0.15)
+            time.sleep(0.05)
             print("🤦 Almost grabbed wrong piece!")
 
     def should_miss_this_move(self, board, move, stockfish):
@@ -933,377 +1442,6 @@ class StockfishBot(multiprocessing.Process):
             miss_probability *= 1.5
 
         return random.random() < min(0.4, miss_probability)
-
-    def select_human_like_move(self, stockfish, board, move_count):
-        """
-        Enhanced human-like move selection with realistic blind spots AND blunder system
-        """
-        if not self.human_accuracy:
-            return stockfish.get_best_move()
-
-        try:
-            # Update psychological state
-            self.update_game_psychology(board, stockfish)
-
-            # NEW: Check if we should force a blunder this move
-            if self.should_force_blunder_now(board, move_count, stockfish):
-                self.force_blunder_this_move = True
-                blunder_move = self.select_blunder_move(stockfish, board, move_count)
-                self.update_blunder_state(move_count)
-                self.force_blunder_this_move = False
-                return blunder_move
-
-            # Get multiple top moves
-            top_moves = stockfish.get_top_moves(10)  # Get even more for realistic selection
-            if not top_moves or len(top_moves) == 0:
-                return stockfish.get_best_move()
-
-            if len(top_moves) == 1:
-                return top_moves[0]['Move']
-
-            best_move = top_moves[0]
-            best_eval = best_move.get('Centipawn', 0)
-            best_move_uci = best_move['Move']
-
-            # CRITICAL POSITIONS - always play best
-            # 1. Mate in 1-2 (humans rarely miss mate in 1)
-            if 'Mate' in best_move and best_move.get('Mate', 0) <= 2:
-                print("🚨 Mate in 1-2 - playing best move")
-                return best_move_uci
-
-            # 2. Free queen (but might miss free rook sometimes)
-            if self.is_free_piece_capture(board, best_move_uci):
-                captured_value = self.get_material_gain(board, best_move_uci)
-                if captured_value >= 9:  # Queen
-                    print("👑 Free queen - playing best move")
-                    return best_move_uci
-                elif captured_value >= 5 and not self.we_are_winning_big:  # Rook, but not if overconfident
-                    print("🏰 Free rook - playing best move")
-                    return best_move_uci
-
-            # 3. Very early opening
-            if move_count < 3:
-                print("📚 Very early opening - playing best move")
-                return best_move_uci
-
-            # 4. Only legal move
-            if len(list(board.legal_moves)) == 1:
-                print("🎯 Only one legal move")
-                return best_move_uci
-
-            # NEW: Check if we should realistically miss the best move
-            if self.should_miss_this_move(board, best_move_uci, stockfish):
-                print(f"👁️ Realistically missing: {best_move_uci}")
-                # Remove best move from candidates
-                top_moves = top_moves[1:]
-                if top_moves:
-                    best_move = top_moves[0]
-                    best_eval = best_move.get('Centipawn', 0)
-                    best_move_uci = best_move['Move']
-
-            # Build candidate list with psychological factors
-            candidate_moves = [best_move]
-
-            # Dynamic threshold based on game state
-            base_threshold = min(50, self.accuracy_threshold)
-
-            # Adjust threshold based on psychology
-            if self.just_blundered:
-                base_threshold *= 0.6  # More careful after blunder
-            elif self.we_are_winning_big:
-                base_threshold *= 1.4  # More sloppy when winning big
-            elif self.consecutive_good_moves > 5:
-                base_threshold *= 0.8  # Playing well, stay focused
-
-            for i, move in enumerate(top_moves[1:], 1):
-                move_eval = move.get('Centipawn', 0)
-                eval_diff = abs(best_eval - move_eval)
-
-                # Skip moves we'd realistically miss
-                if self.should_miss_this_move(board, move['Move'], stockfish):
-                    continue
-
-                # Game phase thresholds
-                current_threshold = base_threshold
-                if move_count < 10:  # Opening
-                    current_threshold = max(30, base_threshold * 0.7)
-                elif move_count > 50:  # Endgame
-                    current_threshold = max(20, base_threshold * 0.5)
-                elif board.is_check():  # Under attack
-                    current_threshold = max(15, base_threshold * 0.4)
-
-                if eval_diff <= current_threshold:
-                    candidate_moves.append(move)
-                    print(f"🎲 Candidate {len(candidate_moves)}: {move['Move']} (-{eval_diff}cp)")
-                elif eval_diff > current_threshold * 2:
-                    break  # Too much worse
-
-            # Selection with psychological bias
-            if len(candidate_moves) == 1:
-                selected_move = candidate_moves[0]['Move']
-                print(f"⭐ Only viable move: {selected_move}")
-            else:
-                # Bias toward attacking moves when winning
-                if self.we_are_winning_big:
-                    # Prefer captures and checks
-                    attack_bias = []
-                    for move in candidate_moves:
-                        bias = 1.0
-                        try:
-                            chess_move = chess.Move.from_uci(move['Move'])
-                            if board.is_capture(chess_move):
-                                bias = 2.0
-                            temp_board = board.copy()
-                            temp_board.push(chess_move)
-                            if temp_board.is_check():
-                                bias *= 1.5
-                        except:
-                            pass
-                        attack_bias.append(bias)
-
-                    # Normalize weights
-                    total_bias = sum(attack_bias)
-                    weights = [b / total_bias for b in attack_bias]
-                else:
-                    # Normal selection weights
-                    if len(candidate_moves) == 2:
-                        weights = [0.75, 0.25]
-                    elif len(candidate_moves) == 3:
-                        weights = [0.60, 0.25, 0.15]
-                    else:
-                        first_weight = 0.50
-                        remaining = 0.50
-                        other_weights = [remaining / (len(candidate_moves) - 1)] * (len(candidate_moves) - 1)
-                        weights = [first_weight] + other_weights
-
-                selected_move = random.choices(candidate_moves, weights=weights)[0]['Move']
-
-                # Log selection
-                selected_index = next(i for i, m in enumerate(candidate_moves) if m['Move'] == selected_move)
-                if selected_index == 0:
-                    print(f"⭐ Selected best available: {selected_move}")
-                else:
-                    eval_diff = abs(candidate_moves[0].get('Centipawn', 0) -
-                                    candidate_moves[selected_index].get('Centipawn', 0))
-                    print(f"🎯 Human choice: {selected_move} (-{eval_diff}cp)")
-
-                    # Track if this was a significant inaccuracy
-                    if eval_diff > 100:
-                        print(f"😅 Slight inaccuracy!")
-                    if eval_diff > 200:
-                        print(f"😬 That wasn't best...")
-
-            return selected_move
-
-        except Exception as e:
-            print(f"Error in human move selection: {e}")
-            return stockfish.get_best_move()
-
-    def calculate_thinking_time(self, board, move, move_count, stockfish=None):
-        """
-        Enhanced human-like thinking with psychological patterns
-        """
-        if not self.enable_human_delays:
-            return 0.1
-
-        # NEW: Blunder thinking patterns
-        if self.force_blunder_this_move:
-            # Blunders often happen when humans think they're calculating but miss something
-            blunder_time = random.uniform(2.0, 8.0)  # Longer think for blunders (ironic!)
-            print(f"🤯 Blunder thinking time: {blunder_time:.1f}s (calculated but missed something)")
-            return blunder_time
-
-        # ============ INSTANT REACTIONS (0.05-0.2s) ============
-
-        # NEW: Pre-move situations (instant mouse click)
-        if move and self.last_opponent_move:
-            # Obvious recapture we were expecting
-            if self.is_obvious_recapture(board, move):
-                thinking_time = random.uniform(0.05, 0.15)
-                print(f"⚡ Pre-move recapture: {thinking_time:.1f}s")
-                return thinking_time
-
-        # ============ LIGHTNING FAST MOVES (0.1-0.3s) ============
-
-        # 1. EARLY OPENING - Super fast first moves
-        if self.is_early_opening(move_count):
-            thinking_time = random.uniform(0.05, 0.25)
-            print(f"⚡ Early opening: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 2. PIECE DEVELOPMENT - Fast in opening
-        if self.is_piece_development_move(board, move, move_count):
-            thinking_time = random.uniform(0.1, 0.35)
-            print(f"🏃 Piece development: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 3. CASTLING - Usually quick decision
-        if move and self.is_obvious_castling(board, move):
-            thinking_time = random.uniform(0.1, 0.5)
-            print(f"🏰 Castling: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 4. EN PASSANT - Obvious when available
-        if move and self.is_obvious_en_passant(board, move):
-            thinking_time = random.uniform(0.1, 0.4)
-            print(f"👻 En passant: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 5. MATE IN ONE - Quick but with slight double-check
-        if move and self.is_mate_in_one(board, move):
-            # Humans sometimes pause to savor the moment
-            if self.we_are_winning_big:
-                thinking_time = random.uniform(0.8, 1.5)  # Savoring the win
-                print(f"☠️ Mate in one (savoring): {thinking_time:.1f}s")
-            else:
-                thinking_time = random.uniform(0.3, 0.7)  # Quick double-check
-                print(f"☠️ Mate in one: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 6. PROMOTION TO QUEEN - Usually obvious
-        if move and self.is_promotion_to_queen(move):
-            thinking_time = random.uniform(0.1, 0.6)
-            print(f"👑 Queen promotion: {thinking_time:.1f}s")
-            return thinking_time
-
-        # ============ VERY FAST MOVES (0.1-0.5s) ============
-
-        # 7. FORCED MOVES - Only one legal option
-        if self.is_forced_move(board):
-            thinking_time = random.uniform(0.1, 0.25)
-            print(f"🎯 Forced move: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 8. CHECK ESCAPES - Limited options
-        if self.is_check_escape_only(board):
-            # More panic if we're already losing
-            if self.previous_evaluation < -300:
-                thinking_time = random.uniform(0.4, 1.2)  # Panic mode
-            else:
-                thinking_time = random.uniform(0.2, 0.8)
-            print(f"🛡️ Check escape: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 9. HANGING PIECE CAPTURES - Super obvious
-        if move and self.is_piece_hanging_obviously(board, move):
-            # But double-check if opponent just blundered
-            if self.opponent_just_blundered(board, stockfish):
-                thinking_time = random.uniform(0.8, 1.5)  # "Is this real?"
-                print(f"🎁 Hanging piece (suspicious): {thinking_time:.1f}s")
-            else:
-                thinking_time = random.uniform(0.1, 0.3)
-                print(f"🎁 Hanging piece: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 10. FORK FOLLOW-UPS - Instant after successful forks
-        if move and self.is_fork_followup(board, move):
-            thinking_time = random.uniform(0.1, 0.5)
-            print(f"🍴 Fork follow-up: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 11. OBVIOUS RECAPTURES - Already handled above for pre-moves
-        if move and self.is_obvious_recapture(board, move):
-            thinking_time = random.uniform(0.1, 0.5)
-            print(f"⚡ Obvious recapture: {thinking_time:.1f}s")
-            return thinking_time
-
-        # ============ FAST MOVES (0.2-0.8s) ============
-
-        # 12. FREE PIECE CAPTURES
-        if move and self.is_free_piece_capture(board, move):
-            thinking_time = random.uniform(0.2, 0.6)
-            print(f"🆓 Free piece: {thinking_time:.1f}s")
-            return thinking_time
-
-        # 13. HUGE MATERIAL GAINS
-        if move and stockfish and self.is_huge_material_gain(board, move, stockfish):
-            thinking_time = random.uniform(0.3, 0.9)
-            print(f"💰 Huge material gain: {thinking_time:.1f}s")
-            return thinking_time
-
-        # ============ BLUNDER REACTIONS ============
-
-        # 14. OPPONENT BLUNDERED - Humans double-check gifts
-        if stockfish and self.opponent_just_blundered(board, stockfish):
-            # Reaction based on size of blunder
-            eval_swing = abs(self.previous_evaluation - stockfish.get_evaluation().get('value', 0))
-            if eval_swing > 500:  # Huge blunder
-                thinking_time = random.uniform(2.0, 4.0)  # "Wait, what??"
-                print(f"😲 Opponent huge blunder - double checking: {thinking_time:.1f}s")
-            else:
-                thinking_time = random.uniform(1.0, 2.5)
-                print(f"🤔 Opponent blundered - checking: {thinking_time:.1f}s")
-            return thinking_time
-
-        # ============ NORMAL COMPLEXITY ANALYSIS ============
-
-        base_time = random.uniform(self.min_thinking_time, self.max_thinking_time * 0.8)
-
-        if stockfish:
-            try:
-                candidate_count = self.count_candidate_moves(board, stockfish)
-
-                # Time based on number of good moves
-                if candidate_count <= 1:
-                    thinking_time = random.uniform(0.4, 1.2)
-                    print(f"🎯 Only move: {thinking_time:.1f}s")
-                elif candidate_count <= 2:
-                    thinking_time = random.uniform(0.8, 2.5)
-                    print(f"🤏 Few options ({candidate_count}): {thinking_time:.1f}s")
-                elif candidate_count <= 4:
-                    thinking_time = random.uniform(1.5, 4.0)
-                    print(f"🤔 Several options ({candidate_count}): {thinking_time:.1f}s")
-                else:
-                    thinking_time = random.uniform(2.5, 6.0)
-                    print(f"🧠 Many options ({candidate_count}): {thinking_time:.1f}s")
-
-                # NEW: Add psychological factors
-                thinking_time = self.add_psychological_delay(thinking_time)
-
-            except Exception as e:
-                print(f"Error in candidate analysis: {e}")
-                thinking_time = base_time
-        else:
-            thinking_time = base_time
-
-        # Position complexity modifier
-        try:
-            complexity_factor = self.analyze_position_complexity(board, move_count)
-            thinking_time *= complexity_factor
-        except:
-            pass
-
-        # Game phase adjustments
-        if move_count > 40:  # Endgame
-            thinking_time *= 1.2
-            # Extra time in critical endgames
-            if len(board.piece_map()) < 8:
-                thinking_time *= 1.3
-        elif self.is_opening_phase(move_count):
-            thinking_time *= 0.6
-
-        # NEW: Rhythm variations
-        # Sometimes humans get into a rhythm and play consistently
-        if self.consecutive_good_moves > 3:
-            # Smooth, consistent timing
-            rhythm_factor = random.uniform(0.9, 1.1)
-        else:
-            # More erratic timing
-            rhythm_factor = random.uniform(0.7, 1.3)
-        thinking_time *= rhythm_factor
-
-        # Final bounds with more variation
-        min_time = 0.1
-        max_time = self.max_thinking_time * 1.2
-
-        # But allow occasional long thinks
-        if random.random() < 0.05:  # 5% chance of deep think
-            max_time *= 2
-            print("💭 Deep calculation...")
-
-        thinking_time = max(min_time, min(thinking_time, max_time))
-
-        return round(thinking_time, 1)
 
     # Converts a move to screen coordinates
     def move_to_screen_pos(self, move):
@@ -1358,61 +1496,67 @@ class StockfishBot(multiprocessing.Process):
 
         print(f"Moving mouse to start position: {start_pos}")
 
-        # NEW: More natural mouse movement
-        movement_duration = random.uniform(0.1, 0.3) if self.enable_human_delays else 0
+        # FASTER mouse movement for quicker play
+        movement_duration = random.uniform(0.05, 0.15) if self.enable_human_delays else 0
         pyautogui.moveTo(start_pos[0], start_pos[1], duration=movement_duration)
         time.sleep(self.mouse_latency)
 
         print("Clicking and holding at start position")
         pyautogui.mouseDown()
 
-        # NEW: Variable hold time (humans don't always grab instantly)
-        hold_time = random.uniform(0.1, 0.3) if self.enable_human_delays else 0.2
+        # FASTER hold time
+        hold_time = random.uniform(0.05, 0.15) if self.enable_human_delays else 0.1
         time.sleep(hold_time)
 
         print(f"Dragging to end position: {end_pos}")
 
-        # NEW: Variable drag speed based on move type
+        # FASTER drag speed based on move type
         if self.enable_human_delays:
-            if self.is_obvious_recapture(chess.Board(), move):
-                drag_duration = random.uniform(0.2, 0.4)  # Fast recapture
+            if self.critical_time_pressure:
+                drag_duration = random.uniform(0.05, 0.1)  # PANIC mode
+            elif self.severe_time_pressure:
+                drag_duration = random.uniform(0.1, 0.2)  # Very fast
+            elif self.is_obvious_recapture(chess.Board(), move):
+                drag_duration = random.uniform(0.1, 0.15)  # Instant recapture
             elif self.just_blundered:
-                drag_duration = random.uniform(0.6, 0.9)  # Careful after blunder
+                drag_duration = random.uniform(0.4, 0.6)  # Still careful after blunder
             else:
-                drag_duration = random.uniform(0.4, 0.7)  # Normal speed
+                drag_duration = random.uniform(0.2, 0.4)  # Normal but faster
         else:
-            drag_duration = 0.5
+            drag_duration = 0.1
 
         pyautogui.moveTo(end_pos[0], end_pos[1], duration=drag_duration)
 
-        # NEW: Sometimes slight overshoot
-        if self.enable_human_delays and random.random() < 0.1:
+        # Rare slight overshoot (less common for faster play)
+        if self.enable_human_delays and random.random() < 0.05 and not self.critical_time_pressure:
             overshoot_x = end_pos[0] + random.randint(-10, 10)
             overshoot_y = end_pos[1] + random.randint(-10, 10)
-            pyautogui.moveTo(overshoot_x, overshoot_y, duration=0.1)
-            time.sleep(0.05)
-            pyautogui.moveTo(end_pos[0], end_pos[1], duration=0.1)
+            pyautogui.moveTo(overshoot_x, overshoot_y, duration=0.05)
+            time.sleep(0.03)
+            pyautogui.moveTo(end_pos[0], end_pos[1], duration=0.05)
 
-        time.sleep(0.2)
+        time.sleep(0.1)  # Reduced from 0.2
 
         print("Releasing mouse at end position")
         pyautogui.mouseUp()
 
-        # NEW: Variable post-move delay
+        # FASTER post-move delay
         if self.enable_human_delays:
-            if self.is_mate_in_one(chess.Board(), move):
-                post_delay = random.uniform(0.5, 1.0)  # Pause after delivering mate
+            if self.critical_time_pressure:
+                post_delay = 0.05  # Almost no delay
+            elif self.is_mate_in_one(chess.Board(), move):
+                post_delay = random.uniform(0.3, 0.6)  # Pause after mate
             else:
-                post_delay = random.uniform(0.2, 0.4)
+                post_delay = random.uniform(0.1, 0.2)  # Faster normal delay
         else:
-            post_delay = 0.3
+            post_delay = 0.15  # Reduced from 0.3
         time.sleep(post_delay)
         print("Move completed")
 
         # Handle promotion
         if len(move) == 5:
             print(f"Promotion detected: {move[4]}")
-            time.sleep(0.5)
+            time.sleep(0.3)  # Reduced from 0.5
             end_pos_x = None
             end_pos_y = None
             if move[4] == "n":
@@ -1445,15 +1589,17 @@ class StockfishBot(multiprocessing.Process):
         try:
             print("Starting StockfishBot process...")
 
-            # NEW: Initialize blunder system for this game
-            self.blunders_this_game = 0
-            self.last_blunder_move = 0
-            self.force_blunder_this_move = False
-            self.game_blunder_log = []
+            # Initialize error system for this game
+            self.errors_this_game = { 'inaccuracy': 0, 'mistake': 0, 'blunder': 0 }
+            self.last_error_move = 0
+            self.force_error_this_move = None
+            self.game_error_log = []
 
-            if self.enable_blunders:
-                print(
-                    f"🎯 Blunder system enabled: {self.blunders_per_game} blunders/game, {self.blunder_severity}cp severity")
+            if self.enable_errors:
+                print(f"🎯 Error system enabled:")
+                print(f"   Target: {self.errors_per_game['inaccuracy']} inaccuracies, "
+                      f"{self.errors_per_game['mistake']} mistakes, "
+                      f"{self.errors_per_game['blunder']} blunders")
 
             # Initialize grabber
             print("Initializing grabber...")
@@ -1462,6 +1608,10 @@ class StockfishBot(multiprocessing.Process):
             else:
                 self.grabber = LichessGrabber(self.chrome_url, self.chrome_session_id)
             print("Grabber initialized successfully")
+
+            # Detect time control
+            self.detect_time_control()
+            print(f"⏰ Time control detected: {self.time_control_type}")
 
             # Initialize Stockfish
             print("Initializing Stockfish...")
@@ -1504,10 +1654,10 @@ class StockfishBot(multiprocessing.Process):
 
                 if self.human_accuracy:
                     print(f"🎭 Human accuracy enabled (threshold: {self.accuracy_threshold}cp)")
-                    print(f"🎯 Target accuracy: 80-90% (will make human-like mistakes!)")
+                    print(f"🎯 Target accuracy: ~85-90% (realistic for skill {self.skill_level})")
                     print(f"🧠 Psychological modeling: ON")
-                    if self.enable_blunders:
-                        print(f"💥 Deliberate blundering: {self.blunders_per_game} per game")
+                    print(f"💥 Complete error system: ON")
+                    print(f"⚡ FAST PLAY MODE: Average move time reduced")
                 else:
                     print("🤖 Playing at maximum strength")
             except PermissionError as e:
@@ -1677,8 +1827,8 @@ class StockfishBot(multiprocessing.Process):
                     if board.is_checkmate():
                         print("Checkmate! Game over.")
 
-                        # Log blunder summary
-                        self.log_blunder_summary()
+                        # Log error summary
+                        self.log_error_summary()
 
                         if self.enable_non_stop_puzzles and self.grabber.is_game_puzzles():
                             self.go_to_next_puzzle()
@@ -1695,8 +1845,8 @@ class StockfishBot(multiprocessing.Process):
                     if self.grabber.is_game_over():
                         print("Game over detected")
 
-                        # Log blunder summary
-                        self.log_blunder_summary()
+                        # Log error summary
+                        self.log_error_summary()
 
                         if self.enable_non_stop_puzzles and self.grabber.is_game_puzzles():
                             self.go_to_next_puzzle()
@@ -1731,8 +1881,8 @@ class StockfishBot(multiprocessing.Process):
                 if board.is_checkmate():
                     print("Opponent checkmate! Game over.")
 
-                    # Log blunder summary
-                    self.log_blunder_summary()
+                    # Log error summary
+                    self.log_error_summary()
 
                     if self.enable_non_stop_puzzles and self.grabber.is_game_puzzles():
                         self.go_to_next_puzzle()
